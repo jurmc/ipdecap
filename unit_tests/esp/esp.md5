@@ -5,3 +5,4 @@
 640a4ff87e9dccfe2638e50a5d68be09  ./aes-cbc_hmac-sha1/aes-cbc_hmac-sha1.cap.output
 78ec49fa68666cfe48384b768ca9288b  ./3des-cbc_null/3des-cbc_null.cap.output
 bdd99d9806d39503175e54c8c62d7e11  ./3des-cbc_hmac-sha1/3des-cbc_hmac-sha1.cap.output
+37ea16c0e8c6a6e122830f912c647ad8  ./aes256-cbc_hmac-sha256-128_in_linux_cooked/aes256-cbc_hmac-sha256-128_in_linux_cooked.cap.output

@@ -6,6 +6,7 @@ clean:
 	-rm -vf ./3des-cbc_null/3des-cbc_null.cap.output
 	-rm -vf ./aes192-cbc_hmac-sha1/aes192-cbc_hmac-sha1.cap.output
 	-rm -vf ./aes256-cbc_hmac-sha1/aes256-cbc_hmac-sha1.cap.output
+	-rm -vf ./aes256-cbc_hmac-sha256-128_in_linux_cooked/aes256-cbc_hmac-sha256-128_in_linux_cooked.cap.output
 	-rm -vf ./aes-cbc_hmac-sha1/aes-cbc_hmac-sha1.cap.output
 	-rm -vf ./des-cbc_hmac-md5/des-cbc_hmac-md5.cap.output
 	-rm -vf ./null_hmac-md5/null_hmac-md5.cap.output
@@ -34,6 +35,12 @@ process_pcap:
 	-i ./aes256-cbc_hmac-sha1/aes256-cbc_hmac-sha1.cap \
 	-o ./aes256-cbc_hmac-sha1/aes256-cbc_hmac-sha1.cap.output \
 	-c ./aes256-cbc_hmac-sha1/aes256-cbc_hmac-sha1.cap.conf
+
+	@echo "*** Processing aes256-cbc_hmac-sha256-128_in_linux_cooked.cap..."
+	../../src/ipdecap \
+	-i ./aes256-cbc_hmac-sha256-128_in_linux_cooked/aes256-cbc_hmac-sha256-128_in_linux_cooked.cap \
+	-o ./aes256-cbc_hmac-sha256-128_in_linux_cooked/aes256-cbc_hmac-sha256-128_in_linux_cooked.cap.output \
+	-c ./aes256-cbc_hmac-sha256-128_in_linux_cooked/aes256-cbc_hmac-sha256-128_in_linux_cooked.cap.conf
 
 	@echo "*** Processing aes-cbc_hmac-sha1.cap..."
 	../../src/ipdecap \
