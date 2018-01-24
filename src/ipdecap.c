@@ -23,6 +23,7 @@
 #include <string.h>
 #include <pcap/pcap.h>
 #include <pcap/vlan.h>
+#include <pcap/sll.h>
 #include <arpa/inet.h>
 #include <sys/types.h>
 #include <sys/socket.h>
@@ -69,6 +70,7 @@ static const struct option args_long[] = {
 };
 
 // Global variables
+pcap_t *pcap_reader;
 pcap_dumper_t *pcap_dumper;
 int ignore_esp;
 
@@ -728,6 +730,165 @@ void process_gre_packet(const u_char *payload, const int payload_len, pcap_hdr *
 
 }
 
+//void process_dlt_header(u_char *payload, pcap_hdr *new_packet_hdr, u_char *new_packet_payload) {
+//  memcpy(new_packet_payload, payload, SLL_HDR_LEN);
+//  payload += SLL_HDR_LEN;
+//  new_packet_payload += SLL_HDR_LEN;
+//}
+
+void process_esp_packet_new(u_char const *payload, const int payload_len, pcap_hdr *new_packet_hdr, u_char *new_packet_payload) {
+
+  const u_char *payload_src = NULL;
+  u_char *payload_dst = NULL;
+  const struct ip *ip_hdr = NULL;
+  esp_packet_t esp_packet;
+  char ip_src[INET_ADDRSTRLEN+1];
+  char ip_dst[INET_ADDRSTRLEN+1];
+  llflow_t *flow = NULL;
+  EVP_CIPHER_CTX *ctx = EVP_CIPHER_CTX_new();
+  const EVP_CIPHER *cipher = NULL;
+  int packet_size, rc, len, remaining;
+  int ivlen;
+
+  // TODO: memset sur new_packet_payload
+  payload_src = payload;
+  payload_dst = new_packet_payload;
+
+  // Copy dlt header
+  memcpy(payload_dst, payload_src, SLL_HDR_LEN);
+  payload_src += SLL_HDR_LEN;
+  payload_dst += SLL_HDR_LEN;
+  packet_size = SLL_HDR_LEN;
+
+  // Read encapsulating IP header to find offset to ESP header
+  ip_hdr = (const struct ip *) payload_src;
+  payload_src += (ip_hdr->ip_hl *4);
+
+  // Read ESP fields
+  memcpy(&esp_packet.spi, payload_src, member_size(esp_packet_t, spi));
+  //esp_packet.spi = ntohl(esp_packet.spi);
+  payload_src += member_size(esp_packet_t, spi);
+  memcpy(&esp_packet.seq, payload_src, member_size(esp_packet_t, seq));
+  //esp_packet.seq = ntohl(esp_packet.seq);
+  payload_src += member_size(esp_packet_t, seq);
+
+  // Extract dst/src IP
+  if (inet_ntop(AF_INET, &(ip_hdr->ip_src),
+                ip_src, INET_ADDRSTRLEN) == NULL)
+    error("Cannot convert source ip address for ESP packet\n");
+
+  if (inet_ntop(AF_INET, &(ip_hdr->ip_dst),
+                ip_dst, INET_ADDRSTRLEN) == NULL)
+    error("Cannot convert destination ip address for ESP packet\n");
+
+  // Find encryption configuration used
+  flow = find_flow(ip_src, ip_dst, esp_packet.spi);
+
+  if (flow == NULL) {
+    verbose("No suitable flow configuration found for src:%s dst:%s spi: %lx copying raw packet\n",
+      ip_src, ip_dst, esp_packet.spi);
+      process_nonip_packet(payload, payload_len, new_packet_hdr, new_packet_payload);
+      return;
+
+  } else {
+    debug_print("Found flow configuration src:%s dst:%s crypt:%s auth:%s spi: %lx\n",
+      ip_src, ip_dst, flow->crypt_name, flow->auth_name, (long unsigned) flow->spi);
+  }
+
+  // Differences between (null) encryption algorithms and others algorithms start here
+  if (flow->crypt_method->openssl_cipher == NULL) {
+
+    remaining = ntohs(ip_hdr->ip_len)
+    - ip_hdr->ip_hl*4
+    - member_size(esp_packet_t, spi)
+    - member_size(esp_packet_t, seq);
+
+    // If non null authentication, discard authentication data
+    if (flow->auth_method->openssl_auth == NULL) {
+      remaining -= flow->auth_method->len;
+    }
+
+    u_char *pad_len = ((u_char *)payload_src + remaining -2);
+
+    remaining = remaining
+      - member_size(esp_packet_t, pad_len)
+      - member_size(esp_packet_t, next_header)
+      - *pad_len;
+
+    packet_size += remaining;
+
+    memcpy(payload_dst, payload_src, remaining);
+    new_packet_hdr->len = packet_size;
+
+  } else {
+
+    if ((cipher = EVP_get_cipherbyname(flow->crypt_method->openssl_cipher)) == NULL)
+      error("Cannot find cipher %s - EVP_get_cipherbyname() err", flow->crypt_method->openssl_cipher);
+
+    EVP_CIPHER_CTX_init(ctx);
+
+    // Copy initialization vector
+    ivlen = EVP_CIPHER_iv_length(cipher);
+    memset(&esp_packet.iv, 0, EVP_MAX_IV_LENGTH);
+    memcpy(&esp_packet.iv, payload_src, ivlen);
+    payload_src += ivlen;
+
+    rc = EVP_DecryptInit_ex(ctx, cipher,NULL, flow->key, esp_packet.iv);
+    if (rc != 1) {
+      error("Error during the initialization of crypto system. Please report this bug with your .pcap file");
+    }
+
+    // ESP payload length to decrypt
+    remaining =  ntohs(ip_hdr->ip_len)
+    - ip_hdr->ip_hl*4
+    - member_size(esp_packet_t, spi)
+    - member_size(esp_packet_t, seq)
+    - ivlen;
+
+    // If non null authentication, discard authentication data
+    if (flow->auth_method->openssl_auth == NULL) {
+      remaining -= flow->auth_method->len;
+    }
+
+    // Do the decryption work
+    rc = EVP_DecryptUpdate(ctx, payload_dst, &len, payload_src, remaining);
+    packet_size += len;
+
+    if (rc != 1) {
+      verbose("Warning: cannot decrypt packet with EVP_DecryptUpdate(). Corrupted ? Cipher is %s, copying raw packet...\n",
+        flow->crypt_method->openssl_cipher);
+      process_nonip_packet(payload, payload_len, new_packet_hdr, new_packet_payload);
+        return;
+    }
+
+    EVP_DecryptFinal_ex(ctx, payload_dst+len, &len);
+    packet_size += len;
+
+    // http://www.mail-archive.com/openssl-users@openssl.org/msg23434.html
+    packet_size +=EVP_CIPHER_CTX_block_size(ctx);
+
+    u_char *pad_len = (new_packet_payload + packet_size -2);
+
+    // Detect obviously badly decrypted packet
+    if (*pad_len >=  EVP_CIPHER_CTX_block_size(ctx)) {
+      verbose("Warning: invalid pad_len field, wrong encryption key ? copying raw packet...\n");
+      process_nonip_packet(payload, payload_len, new_packet_hdr, new_packet_payload);
+      return;
+    }
+
+    // Remove next protocol, pad len fields and padding
+    packet_size = packet_size
+      - member_size(esp_packet_t, pad_len)
+      - member_size(esp_packet_t, next_header)
+      - *pad_len;
+
+    new_packet_hdr->len = packet_size;
+
+    EVP_CIPHER_CTX_cleanup(ctx);
+
+    } /*  flow->crypt_method->openssl_cipher == NULL */
+
+}
 /*
  * Decapsulate an ESP packet:
  * -try to find an ESP configuration entry (ip, spi, algorithms)
@@ -901,6 +1062,7 @@ void handle_packets(u_char *bpf_filter, const struct pcap_pkthdr *pkthdr, const 
   struct pcap_pkthdr *out_pkthdr = NULL;
   u_char *in_payload = NULL;
   u_char *out_payload = NULL;
+  int dlt;
 
   verbose("Processing packet %i\n", packet_num);
 
@@ -931,6 +1093,7 @@ void handle_packets(u_char *bpf_filter, const struct pcap_pkthdr *pkthdr, const 
   out_pkthdr->caplen = in_pkthdr->caplen;
 
   eth_hdr = (const struct ether_header *) in_payload;
+  dlt = pcap_datalink(pcap_reader);
 
   // If IEEE 802.1Q header, remove it before further processing
   if (ntohs(eth_hdr->ether_type) == ETHERTYPE_VLAN) {
@@ -949,10 +1112,19 @@ void handle_packets(u_char *bpf_filter, const struct pcap_pkthdr *pkthdr, const 
 
   if (ntohs(eth_hdr->ether_type) != ETHERTYPE_IP) {
 
-    // Non IP packet ? Just copy
-    process_nonip_packet(in_payload, in_pkthdr->caplen, out_pkthdr, out_payload);
-    pcap_dump((u_char *)pcap_dumper, out_pkthdr, out_payload);
-
+    if (dlt == DLT_LINUX_SLL)
+    {
+        // Non IP packet ? Just copy without manipulging in dlt layer
+        //process_dlt_header(in_payload, out_pkthdr, out_payload);
+        process_esp_packet_new(in_payload, in_pkthdr->caplen, out_pkthdr, out_payload);
+        pcap_dump((u_char *)pcap_dumper, out_pkthdr, out_payload);
+    }
+    else
+    {
+        // Non IP packet ? Just copy
+        process_nonip_packet(in_payload, in_pkthdr->caplen, out_pkthdr, out_payload);
+        pcap_dump((u_char *)pcap_dumper, out_pkthdr, out_payload);
+    }
   } else {
 
     // Find encapsulation type
@@ -1015,7 +1187,7 @@ void handle_packets(u_char *bpf_filter, const struct pcap_pkthdr *pkthdr, const 
 int main(int argc, char **argv) {
 
   char errbuf[PCAP_ERRBUF_SIZE];
-  pcap_t *pcap_reader = NULL;
+  pcap_reader = NULL;
   pcap_dumper = NULL;
   pcap_t *p = NULL;
   struct bpf_program *bpf = NULL;
@@ -1047,7 +1219,7 @@ int main(int argc, char **argv) {
 
   debug_print("snaplen:%i\n", pcap_snapshot(pcap_reader));
 
-  p = pcap_open_dead(DLT_EN10MB, MAXIMUM_SNAPLEN);
+  p = pcap_open_dead(pcap_datalink(pcap_reader), MAXIMUM_SNAPLEN);
 
   // try to compile bpf filter for input packets
   if (global_args.bpf_filter != NULL) {
